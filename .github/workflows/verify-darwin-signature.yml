@@ -1,0 +1,62 @@
+# Verify that re-signing the darwin release binary with rcodesign on Linux
+# (what nix/jrsonnet-cross-darwin.nix now does in postFixup) yields a binary
+# macOS accepts. The release binary is exactly the output after crane's hooks
+# rewrote /nix/store references, i.e. the input to the new postFixup step.
+name: verify-darwin-signature
+on:
+  push:
+    branches: [ci/verify-darwin-signature]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sign:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: cachix/install-nix-action@v31
+      - name: Download release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir out
+          gh release download v0.5.0-pre98 -R deltarocks/jrsonnet -D out \
+            -p jrsonnet-aarch64-darwin -p jrsonnet-experimental-aarch64-darwin
+          for f in out/*; do cp "$f" "$f.signed"; done
+      - name: Re-sign with rcodesign (same nixpkgs as the flake)
+        run: |
+          for f in out/*.signed; do
+            nix run nixpkgs/release-26.05#rcodesign -- sign "$f"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: out/
+  verify:
+    needs: sign
+    runs-on: macos-14
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: out
+      - name: Original release binaries are rejected
+        run: |
+          echo '{a: 1 + 1}' > x.jsonnet
+          for f in out/jrsonnet-aarch64-darwin out/jrsonnet-experimental-aarch64-darwin; do
+            chmod +x "$f"
+            if codesign --verify --strict -v "$f"; then echo "unexpected: $f verifies"; exit 1; fi
+            set +e; "$f" x.jsonnet; rc=$?; set -e
+            echo "$f exit=$rc"
+            [ "$rc" -ne 0 ] || { echo "unexpected: $f ran"; exit 1; }
+          done
+      - name: Re-signed binaries verify and run
+        run: |
+          echo '{a: 1 + 1}' > x.jsonnet
+          for f in out/*.signed; do
+            chmod +x "$f"
+            codesign -dv "$f"
+            codesign --verify --strict -v "$f"
+            "$f" --version
+            "$f" x.jsonnet | tee result.json
+            [ "$(jq .a result.json)" = 2 ]
+          done
